@@ -75,6 +75,15 @@ Add to your Claude Code MCP settings:
 }
 ```
 
+## Security
+
+This tool launches and controls a debugger. By design, it can:
+- Execute arbitrary .NET applications
+- Evaluate expressions within the debugged process
+- Inspect memory and variables
+
+Only use this with code you trust. Do not debug untrusted applications.
+
 ## Example Session
 
 1. Build your .NET app with debug symbols: `dotnet build --configuration Debug`
