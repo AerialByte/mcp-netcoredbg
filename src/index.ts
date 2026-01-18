@@ -739,6 +739,291 @@ server.tool(
   }
 );
 
+// Tool: invoke
+import { spawn } from "child_process";
+import * as path from "path";
+import * as fs from "fs";
+
+// Get harness path relative to this file
+const harnessDir = path.resolve(
+  path.dirname(new URL(import.meta.url).pathname),
+  "..",
+  "harness"
+);
+const harnessDll = path.join(
+  harnessDir,
+  "bin",
+  "Debug",
+  "net8.0",
+  "McpNetcoreDbg.Harness.dll"
+);
+
+interface InvokeResult {
+  success: boolean;
+  method?: string;
+  args?: unknown[];
+  returnType?: string;
+  returnValue?: unknown;
+  durationMs?: number;
+  logs?: Array<{ level: string; message: string; category?: string }>;
+  stdout?: string;
+  error?: string;
+  errorDetails?: {
+    type?: string;
+    reason?: string;
+    constructors?: Array<{ params: string[] }>;
+    methods?: Array<{
+      name: string;
+      params: string[];
+      returnType: string;
+      isStatic: boolean;
+    }>;
+    stackTrace?: string;
+  };
+}
+
+async function runHarness(requestJson: string): Promise<InvokeResult> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("dotnet", [harnessDll, requestJson], {
+      cwd: harnessDir,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.on("data", (data) => {
+      stdout += data.toString();
+    });
+
+    child.stderr.on("data", (data) => {
+      stderr += data.toString();
+    });
+
+    child.on("close", (code) => {
+      try {
+        const result = JSON.parse(stdout) as InvokeResult;
+        resolve(result);
+      } catch {
+        resolve({
+          success: false,
+          error: `Failed to parse harness output: ${stdout || stderr}`,
+          errorDetails: { reason: stderr || "Unknown error" },
+        });
+      }
+    });
+
+    child.on("error", (err) => {
+      reject(err);
+    });
+  });
+}
+
+server.tool(
+  "invoke",
+  "Invoke a specific method in a .NET assembly. Can run with or without debugging. Use debug mode to set breakpoints and step through the code.",
+  {
+    assembly: z.string().describe("Path to the .NET DLL containing the type"),
+    type: z.string().describe("Fully qualified type name (e.g., 'MyApp.Services.Calculator')"),
+    method: z.string().describe("Method name to invoke"),
+    args: z
+      .array(z.any())
+      .optional()
+      .describe("Method arguments as JSON array"),
+    ctorArgs: z
+      .array(z.any())
+      .optional()
+      .describe("Constructor arguments for instance methods"),
+    debug: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe("Launch under debugger for breakpoint support"),
+    cwd: z
+      .string()
+      .optional()
+      .describe("Working directory for the invocation"),
+  },
+  async ({ assembly, type, method, args, ctorArgs, debug, cwd }) => {
+    // Check harness exists
+    if (!fs.existsSync(harnessDll)) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Harness not built. Run 'dotnet build' in ${harnessDir} first.`,
+          },
+        ],
+      };
+    }
+
+    // Resolve assembly path
+    const resolvedAssembly = path.isAbsolute(assembly)
+      ? assembly
+      : path.resolve(cwd || process.cwd(), assembly);
+
+    if (!fs.existsSync(resolvedAssembly)) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Assembly not found: ${resolvedAssembly}`,
+          },
+        ],
+      };
+    }
+
+    // Build request JSON
+    const request = {
+      assembly: resolvedAssembly,
+      type,
+      method,
+      args: args || [],
+      ctorArgs: ctorArgs || [],
+    };
+
+    const requestJson = JSON.stringify(request);
+
+    if (debug) {
+      // Launch under debugger
+      if (dapClient) {
+        try {
+          await dapClient.disconnect(true);
+        } catch {
+          // Ignore cleanup errors
+        }
+      }
+
+      breakpointsByFile.clear();
+      outputBuffer.length = 0;
+      lastStoppedReason = null;
+      lastStoppedThreadId = null;
+
+      dapClient = new DAPClient();
+
+      dapClient.on("stopped", (body: StoppedEventBody) => {
+        lastStoppedReason = body.reason;
+        lastStoppedThreadId = body.threadId || null;
+      });
+
+      dapClient.on("output", (body: OutputEventBody) => {
+        if (body.output) {
+          outputBuffer.push(body.output);
+          while (outputBuffer.length > 100) {
+            outputBuffer.shift();
+          }
+        }
+      });
+
+      dapClient.on("terminated", () => {
+        dapClient = null;
+      });
+
+      dapClient.on("error", (err: Error) => {
+        console.error("DAP error:", err.message);
+      });
+
+      await dapClient.start();
+
+      await dapClient.sendRequest("launch", {
+        program: harnessDll,
+        args: [requestJson],
+        cwd: cwd || path.dirname(resolvedAssembly),
+        stopAtEntry: false,
+        console: "internalConsole",
+      });
+
+      await dapClient.sendRequest("configurationDone", {});
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Invoking ${type}.${method} under debugger.\nSet breakpoints in your source files, then use 'continue' to run.\nUse 'output' to see the result when complete.`,
+          },
+        ],
+      };
+    } else {
+      // Run directly without debugging
+      try {
+        const result = await runHarness(requestJson);
+
+        if (result.success) {
+          let response = `✓ ${result.method}\n`;
+          response += `Duration: ${result.durationMs?.toFixed(2)}ms\n`;
+          response += `Return type: ${result.returnType}\n`;
+          response += `Return value: ${JSON.stringify(result.returnValue, null, 2)}`;
+
+          if (result.logs && result.logs.length > 0) {
+            response += `\n\nLogs:\n`;
+            for (const log of result.logs) {
+              response += `  [${log.level}] ${log.message}\n`;
+            }
+          }
+
+          if (result.stdout && result.stdout.trim()) {
+            response += `\nStdout:\n${result.stdout}`;
+          }
+
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: response,
+              },
+            ],
+          };
+        } else {
+          let response = `✗ ${result.error}\n`;
+
+          if (result.errorDetails) {
+            if (result.errorDetails.reason) {
+              response += `Reason: ${result.errorDetails.reason}\n`;
+            }
+
+            if (result.errorDetails.constructors) {
+              response += `\nAvailable constructors:\n`;
+              for (const ctor of result.errorDetails.constructors) {
+                response += `  (${ctor.params.join(", ")})\n`;
+              }
+            }
+
+            if (result.errorDetails.methods) {
+              response += `\nAvailable methods:\n`;
+              for (const m of result.errorDetails.methods) {
+                const staticMod = m.isStatic ? "static " : "";
+                response += `  ${staticMod}${m.returnType} ${m.name}(${m.params.join(", ")})\n`;
+              }
+            }
+
+            if (result.errorDetails.stackTrace) {
+              response += `\nStack trace:\n${result.errorDetails.stackTrace}`;
+            }
+          }
+
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: response,
+              },
+            ],
+          };
+        }
+      } catch (err) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Failed to run harness: ${err instanceof Error ? err.message : String(err)}`,
+            },
+          ],
+        };
+      }
+    }
+  }
+);
+
 // Start the server
 async function main() {
   const transport = new StdioServerTransport();
