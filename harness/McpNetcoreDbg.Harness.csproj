@@ -5,6 +5,8 @@
     <TargetFramework>net8.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <!-- Allow running on newer .NET versions -->
+    <RollForward>LatestMajor</RollForward>
   </PropertyGroup>
 
   <ItemGroup>

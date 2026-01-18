@@ -160,8 +160,7 @@ sudo ln -sf /opt/netcoredbg/netcoredbg /usr/local/bin/netcoredbg
 npm install
 npm run build
 
-# Build the method invocation harness (required for `invoke` tool)
-cd harness && dotnet build && cd ..
+# The method invocation harness is auto-built on first use
 ```
 
 ## Usage with Claude Code

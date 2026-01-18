@@ -740,7 +740,7 @@ server.tool(
 );
 
 // Tool: invoke
-import { spawn } from "child_process";
+import { spawn, spawnSync } from "child_process";
 import * as path from "path";
 import * as fs from "fs";
 
@@ -757,6 +757,38 @@ const harnessDll = path.join(
   "net8.0",
   "McpNetcoreDbg.Harness.dll"
 );
+
+// Build harness if needed
+async function ensureHarnessBuilt(): Promise<{ success: boolean; error?: string }> {
+  if (fs.existsSync(harnessDll)) {
+    return { success: true };
+  }
+
+  // Check if harness source exists
+  const csproj = path.join(harnessDir, "McpNetcoreDbg.Harness.csproj");
+  if (!fs.existsSync(csproj)) {
+    return {
+      success: false,
+      error: `Harness project not found at ${harnessDir}. Please ensure the MCP server is installed correctly.`,
+    };
+  }
+
+  // Build the harness
+  const result = spawnSync("dotnet", ["build", "-c", "Debug"], {
+    cwd: harnessDir,
+    stdio: ["pipe", "pipe", "pipe"],
+    encoding: "utf-8",
+  });
+
+  if (result.status !== 0) {
+    return {
+      success: false,
+      error: `Failed to build harness: ${result.stderr || result.stdout}`,
+    };
+  }
+
+  return { success: true };
+}
 
 interface InvokeResult {
   success: boolean;
@@ -845,13 +877,14 @@ server.tool(
       .describe("Working directory for the invocation"),
   },
   async ({ assembly, type, method, args, ctorArgs, debug, cwd }) => {
-    // Check harness exists
-    if (!fs.existsSync(harnessDll)) {
+    // Ensure harness is built (auto-build if needed)
+    const buildResult = await ensureHarnessBuilt();
+    if (!buildResult.success) {
       return {
         content: [
           {
             type: "text" as const,
-            text: `Harness not built. Run 'dotnet build' in ${harnessDir} first.`,
+            text: buildResult.error || "Failed to build harness",
           },
         ],
       };
