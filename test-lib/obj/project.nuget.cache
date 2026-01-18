@@ -1,0 +1,12 @@
+{
+  "version": 2,
+  "dgSpecHash": "zFeYC3eQdtw=",
+  "success": true,
+  "projectFilePath": "/home/claude-code-1/code/mcp-netcoredbg/test-lib/TestLib.csproj",
+  "expectedPackageFiles": [
+    "/home/claude-code-1/.nuget/packages/microsoft.extensions.dependencyinjection.abstractions/10.0.2/microsoft.extensions.dependencyinjection.abstractions.10.0.2.nupkg.sha512",
+    "/home/claude-code-1/.nuget/packages/microsoft.extensions.logging.abstractions/10.0.2/microsoft.extensions.logging.abstractions.10.0.2.nupkg.sha512",
+    "/home/claude-code-1/.nuget/packages/system.diagnostics.diagnosticsource/10.0.2/system.diagnostics.diagnosticsource.10.0.2.nupkg.sha512"
+  ],
+  "logs": []
+}

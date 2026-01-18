@@ -1,0 +1,13 @@
+/home/claude-code-1/code/mcp-netcoredbg/test-lib/bin/Debug/net8.0/TestLib.deps.json
+/home/claude-code-1/code/mcp-netcoredbg/test-lib/bin/Debug/net8.0/TestLib.dll
+/home/claude-code-1/code/mcp-netcoredbg/test-lib/bin/Debug/net8.0/TestLib.pdb
+/home/claude-code-1/code/mcp-netcoredbg/test-lib/obj/Debug/net8.0/TestLib.csproj.AssemblyReference.cache
+/home/claude-code-1/code/mcp-netcoredbg/test-lib/obj/Debug/net8.0/TestLib.GeneratedMSBuildEditorConfig.editorconfig
+/home/claude-code-1/code/mcp-netcoredbg/test-lib/obj/Debug/net8.0/TestLib.AssemblyInfoInputs.cache
+/home/claude-code-1/code/mcp-netcoredbg/test-lib/obj/Debug/net8.0/TestLib.AssemblyInfo.cs
+/home/claude-code-1/code/mcp-netcoredbg/test-lib/obj/Debug/net8.0/TestLib.csproj.CoreCompileInputs.cache
+/home/claude-code-1/code/mcp-netcoredbg/test-lib/obj/Debug/net8.0/TestLib.sourcelink.json
+/home/claude-code-1/code/mcp-netcoredbg/test-lib/obj/Debug/net8.0/TestLib.dll
+/home/claude-code-1/code/mcp-netcoredbg/test-lib/obj/Debug/net8.0/refint/TestLib.dll
+/home/claude-code-1/code/mcp-netcoredbg/test-lib/obj/Debug/net8.0/TestLib.pdb
+/home/claude-code-1/code/mcp-netcoredbg/test-lib/obj/Debug/net8.0/ref/TestLib.dll

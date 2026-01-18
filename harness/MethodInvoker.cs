@@ -3,6 +3,7 @@ using System.Reflection;
 using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using McpNetcoreDbg.Harness.Models;
 
 namespace McpNetcoreDbg.Harness;
@@ -10,16 +11,194 @@ namespace McpNetcoreDbg.Harness;
 public class MethodInvoker
 {
     private readonly CapturingLoggerProvider _loggerProvider;
-    private readonly IServiceProvider _serviceProvider;
+    private IServiceProvider? _serviceProvider;
+    private readonly Dictionary<Type, Type> _interfaceToConcreteMap = new();
 
     public MethodInvoker(CapturingLoggerProvider loggerProvider)
     {
         _loggerProvider = loggerProvider;
+    }
 
+    private IServiceProvider BuildServiceProvider(Assembly targetAssembly)
+    {
         var services = new ServiceCollection();
-        services.AddSingleton<ILoggerFactory>(new CapturingLoggerFactory(loggerProvider));
+
+        // Register logging
+        services.AddSingleton<ILoggerFactory>(new CapturingLoggerFactory(_loggerProvider));
         services.AddSingleton(typeof(ILogger<>), typeof(Logger<>));
-        _serviceProvider = services.BuildServiceProvider();
+
+        // Register HttpClient for external API calls
+        services.AddSingleton<HttpClient>();
+
+        // Register IOptions<T> support - creates empty options by default
+        services.AddSingleton(typeof(IOptions<>), typeof(EmptyOptionsWrapper<>));
+
+        // Scan target assembly and all referenced assemblies for interface implementations
+        var assemblies = GetAssembliesWithReferences(targetAssembly);
+        ScanAndRegisterServices(services, assemblies);
+
+        return services.BuildServiceProvider();
+    }
+
+    private List<Assembly> GetAssembliesWithReferences(Assembly rootAssembly)
+    {
+        var assemblies = new List<Assembly> { rootAssembly };
+        var assemblyDir = Path.GetDirectoryName(rootAssembly.Location) ?? "";
+
+        foreach (var refName in rootAssembly.GetReferencedAssemblies())
+        {
+            try
+            {
+                // Try to load from the same directory as the root assembly
+                var refPath = Path.Combine(assemblyDir, refName.Name + ".dll");
+                if (File.Exists(refPath))
+                {
+                    var refAssembly = Assembly.LoadFrom(refPath);
+                    assemblies.Add(refAssembly);
+                }
+            }
+            catch
+            {
+                // Skip assemblies that can't be loaded
+            }
+        }
+
+        return assemblies;
+    }
+
+    private void ScanAndRegisterServices(IServiceCollection services, List<Assembly> assemblies)
+    {
+        // Find all interfaces and their concrete implementations
+        var interfaces = new Dictionary<Type, List<Type>>();
+
+        foreach (var assembly in assemblies)
+        {
+            Type[] types;
+            try
+            {
+                types = assembly.GetTypes();
+            }
+            catch (ReflectionTypeLoadException ex)
+            {
+                // GetTypes() fails if some types can't be loaded, but we can still get the ones that did load
+                types = ex.Types.Where(t => t != null).ToArray()!;
+            }
+            catch
+            {
+                // Skip assemblies that completely fail
+                continue;
+            }
+
+            foreach (var type in types)
+            {
+                try
+                {
+                    if (type.IsClass && !type.IsAbstract && type.IsPublic)
+                    {
+                        foreach (var iface in type.GetInterfaces())
+                        {
+                            // Skip generic interfaces and system/microsoft interfaces
+                            if (iface.IsGenericType)
+                                continue;
+
+                            if (iface.Namespace?.StartsWith("System") == true ||
+                                iface.Namespace?.StartsWith("Microsoft") == true)
+                                continue;
+
+                            if (!interfaces.ContainsKey(iface))
+                                interfaces[iface] = new List<Type>();
+
+                            interfaces[iface].Add(type);
+                        }
+                    }
+                }
+                catch
+                {
+                    // Skip types that fail to inspect
+                }
+            }
+        }
+
+        // Register implementations - prefer naming convention (IFoo -> Foo)
+        foreach (var kvp in interfaces)
+        {
+            var iface = kvp.Key;
+            var implementations = kvp.Value;
+
+            if (implementations.Count == 0)
+                continue;
+
+            Type? bestMatch = null;
+
+            // Look for naming convention match: IFoo -> Foo or IFooBar -> FooBar
+            var expectedName = iface.Name.StartsWith("I") ? iface.Name.Substring(1) : iface.Name;
+            bestMatch = implementations.FirstOrDefault(t => t.Name == expectedName);
+
+            // Fallback: use the first implementation
+            bestMatch ??= implementations.First();
+
+            // Register the mapping
+            _interfaceToConcreteMap[iface] = bestMatch;
+            services.AddTransient(iface, sp => ResolveWithDI(sp, bestMatch));
+        }
+    }
+
+    private object ResolveWithDI(IServiceProvider sp, Type concreteType)
+    {
+        var constructors = concreteType.GetConstructors()
+            .OrderByDescending(c => c.GetParameters().Length)
+            .ToList();
+
+        foreach (var ctor in constructors)
+        {
+            try
+            {
+                var parameters = ctor.GetParameters();
+                var args = new object?[parameters.Length];
+
+                for (int i = 0; i < parameters.Length; i++)
+                {
+                    var param = parameters[i];
+
+                    // Try to resolve from service provider
+                    var service = sp.GetService(param.ParameterType);
+                    if (service != null)
+                    {
+                        args[i] = service;
+                    }
+                    else if (param.HasDefaultValue)
+                    {
+                        args[i] = param.DefaultValue;
+                    }
+                    else if (!param.ParameterType.IsInterface && !param.ParameterType.IsAbstract)
+                    {
+                        // Try to create concrete type with parameterless constructor
+                        if (param.ParameterType.GetConstructor(Type.EmptyTypes) != null)
+                        {
+                            args[i] = Activator.CreateInstance(param.ParameterType);
+                        }
+                        else
+                        {
+                            throw new InvalidOperationException(
+                                $"Cannot resolve parameter '{param.Name}' of type '{param.ParameterType.Name}'");
+                        }
+                    }
+                    else
+                    {
+                        throw new InvalidOperationException(
+                            $"Cannot resolve parameter '{param.Name}' of type '{param.ParameterType.Name}'");
+                    }
+                }
+
+                return ctor.Invoke(args);
+            }
+            catch
+            {
+                continue;
+            }
+        }
+
+        throw new InvalidOperationException($"Cannot construct type '{concreteType.FullName}'");
     }
 
     public InvokeResult Invoke(InvokeRequest request)
@@ -44,6 +223,9 @@ public class MethodInvoker
             }
 
             var assembly = Assembly.LoadFrom(assemblyPath);
+
+            // Build service provider with auto-discovered services from the target assembly
+            _serviceProvider = BuildServiceProvider(assembly);
 
             // Find type
             var type = assembly.GetType(request.Type);
@@ -174,24 +356,25 @@ public class MethodInvoker
             return Activator.CreateInstance(type);
         }
 
-        // Try to find matching constructor
+        // Try to find matching constructor with provided args
         var argCount = ctorArgs?.Length ?? 0;
         var ctor = constructors.FirstOrDefault(c => c.GetParameters().Length == argCount);
 
-        if (ctor != null)
+        if (ctor != null && ctorArgs != null && ctorArgs.Length > 0)
         {
             var parameters = ctor.GetParameters();
             var convertedArgs = ConvertArguments(parameters, ctorArgs);
             return ctor.Invoke(convertedArgs);
         }
 
-        // Try to resolve using DI for interface parameters
+        // Try to resolve using DI for interface/abstract parameters
         foreach (var constructor in constructors.OrderByDescending(c => c.GetParameters().Length))
         {
             try
             {
                 var parameters = constructor.GetParameters();
                 var args = new object?[parameters.Length];
+                var allResolved = true;
 
                 for (int i = 0; i < parameters.Length; i++)
                 {
@@ -202,10 +385,10 @@ public class MethodInvoker
                     {
                         args[i] = ConvertValue(ctorArgs[i], param.ParameterType);
                     }
-                    // Try DI resolution
+                    // Try DI resolution for interfaces/abstract types
                     else if (param.ParameterType.IsInterface || param.ParameterType.IsAbstract)
                     {
-                        var service = _serviceProvider.GetService(param.ParameterType);
+                        var service = _serviceProvider?.GetService(param.ParameterType);
                         if (service != null)
                         {
                             args[i] = service;
@@ -216,8 +399,30 @@ public class MethodInvoker
                         }
                         else
                         {
-                            throw new InvalidOperationException(
-                                $"Cannot resolve parameter '{param.Name}' of type '{GetFriendlyTypeName(param.ParameterType)}'");
+                            allResolved = false;
+                            break;
+                        }
+                    }
+                    // Try creating concrete types directly
+                    else if (!param.ParameterType.IsInterface && !param.ParameterType.IsAbstract)
+                    {
+                        var service = _serviceProvider?.GetService(param.ParameterType);
+                        if (service != null)
+                        {
+                            args[i] = service;
+                        }
+                        else if (param.ParameterType.GetConstructor(Type.EmptyTypes) != null)
+                        {
+                            args[i] = Activator.CreateInstance(param.ParameterType);
+                        }
+                        else if (param.HasDefaultValue)
+                        {
+                            args[i] = param.DefaultValue;
+                        }
+                        else
+                        {
+                            allResolved = false;
+                            break;
                         }
                     }
                     else if (param.HasDefaultValue)
@@ -226,12 +431,15 @@ public class MethodInvoker
                     }
                     else
                     {
-                        throw new InvalidOperationException(
-                            $"Missing value for parameter '{param.Name}' of type '{GetFriendlyTypeName(param.ParameterType)}'");
+                        allResolved = false;
+                        break;
                     }
                 }
 
-                return constructor.Invoke(args);
+                if (allResolved)
+                {
+                    return constructor.Invoke(args);
+                }
             }
             catch
             {
@@ -239,12 +447,30 @@ public class MethodInvoker
             }
         }
 
+        // Build helpful error message with constructor info
         var ctorInfo = constructors.Select(c => new CtorSignature
         {
             Params = c.GetParameters().Select(p => $"{GetFriendlyTypeName(p.ParameterType)} {p.Name}").ToList()
         }).ToList();
 
-        throw new InvalidOperationException($"Cannot construct type '{type.FullName}'")
+        // List what services we discovered
+        var discoveredServices = _interfaceToConcreteMap
+            .Select(kvp => $"{kvp.Key.Name} -> {kvp.Value.Name}")
+            .Take(30)
+            .ToList();
+
+        // List what the constructors need
+        var neededInterfaces = constructors
+            .SelectMany(c => c.GetParameters())
+            .Where(p => p.ParameterType.IsInterface)
+            .Select(p => p.ParameterType.FullName)
+            .Distinct()
+            .ToList();
+
+        throw new InvalidOperationException(
+            $"Cannot construct type '{type.FullName}'.\n" +
+            $"Needed interfaces: [{string.Join(", ", neededInterfaces)}]\n" +
+            $"Discovered services ({_interfaceToConcreteMap.Count}): [{string.Join(", ", discoveredServices)}]")
         {
             Data = { ["constructors"] = ctorInfo }
         };
@@ -403,4 +629,13 @@ public class MethodInvoker
         result.ErrorDetails = details;
         return result;
     }
+}
+
+/// <summary>
+/// IOptions wrapper that returns an empty/default instance of T.
+/// Used for auto-wiring when no explicit configuration is provided.
+/// </summary>
+internal class EmptyOptionsWrapper<T> : IOptions<T> where T : class, new()
+{
+    public T Value { get; } = new T();
 }
