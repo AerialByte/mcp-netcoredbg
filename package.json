@@ -1,0 +1,33 @@
+{
+  "name": "mcp-netcoredbg",
+  "version": "1.0.0",
+  "description": "MCP server for .NET debugging via netcoredbg",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "mcp-netcoredbg": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js"
+  },
+  "keywords": [
+    "mcp",
+    "debugger",
+    "dotnet",
+    "netcoredbg",
+    "dap"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.7.0"
+  }
+}
