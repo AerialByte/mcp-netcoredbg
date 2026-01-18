@@ -165,7 +165,17 @@ npm run build
 
 ## Usage with Claude Code
 
-Add to your Claude Code MCP settings:
+**Quick install:**
+```bash
+# Clone and build
+git clone https://github.com/AerialByte/mcp-netcoredbg.git
+cd mcp-netcoredbg && npm install && npm run build
+
+# Add to Claude Code
+claude mcp add netcoredbg -- node $(pwd)/dist/index.js
+```
+
+**Or manually** add to your Claude Code MCP settings:
 
 ```json
 {
