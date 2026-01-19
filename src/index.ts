@@ -45,8 +45,87 @@ interface WatchState {
   lastChildPid: number | null;
   reconnecting: boolean;
   reconnectPromise: Promise<void> | null;
+  ports: number[]; // Ports used by the app (for port release detection)
+  earlyCleanupDone: boolean; // Track if early cleanup was done in current cycle
 }
 let watchState: WatchState | null = null;
+
+// Extract port numbers from applicationUrl string (e.g., "https://localhost:7179;http://localhost:5151")
+function extractPortsFromUrls(applicationUrl: string | undefined): number[] {
+  if (!applicationUrl) return [];
+  const ports: number[] = [];
+  const urls = applicationUrl.split(";");
+  for (const url of urls) {
+    const match = url.match(/:(\d+)/);
+    if (match) {
+      ports.push(parseInt(match[1], 10));
+    }
+  }
+  return ports;
+}
+
+// Check if a port is currently in use (LISTEN state)
+function isPortListening(port: number): boolean {
+  try {
+    // Use ss to check for LISTEN sockets on this port
+    const result = execSync(`ss -tln 2>/dev/null | grep -q ':${port} ' && echo "in_use" || echo "free"`, {
+      encoding: "utf-8",
+      timeout: 1000,
+    }).trim();
+    return result === "in_use";
+  } catch {
+    return false;
+  }
+}
+
+// Check if a port has sockets in TIME_WAIT state (can cause binding issues briefly)
+function isPortInTimeWait(port: number): boolean {
+  try {
+    // Use ss to check for TIME_WAIT sockets on this port
+    const result = execSync(`ss -tn state time-wait 2>/dev/null | grep -q ':${port} ' && echo "in_use" || echo "free"`, {
+      encoding: "utf-8",
+      timeout: 1000,
+    }).trim();
+    return result === "in_use";
+  } catch {
+    return false;
+  }
+}
+
+// Check if a port is truly available (not LISTEN and not TIME_WAIT)
+function isPortInUse(port: number): boolean {
+  return isPortListening(port) || isPortInTimeWait(port);
+}
+
+// Wait for ports to be fully released with retry logic
+async function waitForPortsRelease(ports: number[], maxWaitMs: number = 15000): Promise<{ released: boolean; portsStillInUse: number[] }> {
+  const startTime = Date.now();
+  const checkIntervalMs = 300; // Check every 300ms
+
+  while (Date.now() - startTime < maxWaitMs) {
+    // Check LISTEN sockets first (most important)
+    const listeningPorts = ports.filter((p) => isPortListening(p));
+    if (listeningPorts.length > 0) {
+      await new Promise((r) => setTimeout(r, checkIntervalMs));
+      continue;
+    }
+
+    // All LISTEN sockets cleared, now check TIME_WAIT
+    const timeWaitPorts = ports.filter((p) => isPortInTimeWait(p));
+    if (timeWaitPorts.length === 0) {
+      // All clear!
+      return { released: true, portsStillInUse: [] };
+    }
+
+    // TIME_WAIT sockets exist - wait a bit more
+    // TIME_WAIT typically lasts 60s on Linux, but often clears faster
+    await new Promise((r) => setTimeout(r, checkIntervalMs));
+  }
+
+  // Timeout - return current state
+  const stillInUse = ports.filter((p) => isPortInUse(p));
+  return { released: stillInUse.length === 0, portsStillInUse: stillInUse };
+}
 
 // Find child .NET process spawned by dotnet watch
 // In modern .NET (8+), the hierarchy is: dotnet watch -> dotnet-watch.dll -> dotnet run -> app executable
@@ -149,13 +228,8 @@ function isProcessRunning(pid: number): boolean {
   }
 }
 
-// Auto-reconnect logic for watch mode
-async function watchReconnect(): Promise<void> {
-  if (!watchState || watchState.reconnecting) return;
-
-  watchState.reconnecting = true;
-  outputBuffer.push("[Hot Reload] Detecting app restart, reconnecting debugger...\n");
-
+// Cleanup old process and wait for ports - called during reconnection
+async function cleanupOldProcess(oldPid: number): Promise<void> {
   // Disconnect existing client
   if (dapClient) {
     try {
@@ -165,6 +239,44 @@ async function watchReconnect(): Promise<void> {
     }
     dapClient = null;
   }
+
+  // Kill the old process if it's still running
+  if (isProcessRunning(oldPid)) {
+    outputBuffer.push(`[Hot Reload] Killing orphaned process ${oldPid}...\n`);
+    try {
+      process.kill(oldPid, "SIGKILL");
+    } catch {
+      // Process may have already exited
+    }
+  }
+
+  // Wait for old process to fully terminate
+  outputBuffer.push(`[Hot Reload] Waiting for process ${oldPid} to fully terminate...\n`);
+  const terminateStart = Date.now();
+  while (Date.now() - terminateStart < 5000) {
+    if (!isProcessRunning(oldPid)) {
+      outputBuffer.push(`[Hot Reload] Process ${oldPid} terminated\n`);
+      break;
+    }
+    await new Promise((r) => setTimeout(r, 50));
+  }
+
+  // Wait for ports to be released
+  const portsToCheck = watchState?.ports || [];
+  if (portsToCheck.length > 0) {
+    outputBuffer.push(`[Hot Reload] Waiting for ports to be released: ${portsToCheck.join(", ")}...\n`);
+    const { released, portsStillInUse } = await waitForPortsRelease(portsToCheck, 10000);
+    if (released) {
+      outputBuffer.push("[Hot Reload] All ports released\n");
+    } else {
+      outputBuffer.push(`[Hot Reload] Warning: Ports still in use: ${portsStillInUse.join(", ")}\n`);
+    }
+  }
+}
+
+// Attach debugger to new process - called after cleanup
+async function attachToNewProcess(oldPid: number | null): Promise<boolean> {
+  if (!watchState) return false;
 
   // Wait for new process to spawn (poll for up to 30 seconds)
   let newPid: number | null = null;
@@ -176,7 +288,7 @@ async function watchReconnect(): Promise<void> {
     if (!watchState?.watchProcess.pid) break;
 
     newPid = findDotnetChildPid(watchState.watchProcess.pid, watchState.projectPath);
-    if (newPid && newPid !== watchState.lastChildPid) {
+    if (newPid && newPid !== oldPid) {
       // Give the process a moment to initialize
       await new Promise((r) => setTimeout(r, 1000));
       break;
@@ -185,8 +297,7 @@ async function watchReconnect(): Promise<void> {
 
   if (!newPid) {
     outputBuffer.push("[Hot Reload] Failed to find new process, watch mode may be broken\n");
-    watchState.reconnecting = false;
-    return;
+    return false;
   }
 
   // Attach to new process
@@ -238,12 +349,39 @@ async function watchReconnect(): Promise<void> {
     }
 
     outputBuffer.push(`[Hot Reload] Reconnected to process ${newPid}\n`);
+    return true;
   } catch (err) {
     const error = err as Error;
     outputBuffer.push(`[Hot Reload] Reconnect failed: ${error.message}\n`);
+    return false;
+  }
+}
+
+// Auto-reconnect logic for watch mode
+// skipCleanup: true if early detection already handled cleanup
+async function watchReconnect(skipCleanup: boolean = false): Promise<void> {
+  if (!watchState) return;
+
+  // If not skipping cleanup, check if already reconnecting
+  if (!skipCleanup && watchState.reconnecting) return;
+
+  watchState.reconnecting = true;
+  const oldPid = watchState.lastChildPid;
+
+  if (!skipCleanup) {
+    outputBuffer.push("[Hot Reload] Detecting app restart, reconnecting debugger...\n");
+
+    // Do cleanup if not already done
+    if (oldPid) {
+      await cleanupOldProcess(oldPid);
+    }
   }
 
+  // Attach to new process
+  await attachToNewProcess(oldPid);
+
   watchState.reconnecting = false;
+  watchState.earlyCleanupDone = false;
 }
 
 // Stale code detection - compare source vs compiled modification times
@@ -584,8 +722,13 @@ server.tool(
       .array(z.string())
       .optional()
       .describe("Additional arguments to pass to dotnet watch"),
+    noHotReload: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe("Disable in-process hot reload, forcing full restarts on every change. Use this for reliable debugging of async methods."),
   },
-  async ({ projectPath, launchProfile, args }) => {
+  async ({ projectPath, launchProfile, args, noHotReload }) => {
     // Clean up any existing watch state
     if (watchState) {
       try {
@@ -628,7 +771,15 @@ server.tool(
     }
 
     // Build dotnet watch arguments
-    const watchArgs = ["watch", "run"];
+    const watchArgs = ["watch"];
+
+    // Disable in-process hot reload if requested (forces full restarts)
+    // This is useful for debugging async methods which don't hot reload reliably
+    if (noHotReload) {
+      watchArgs.push("--no-hot-reload");
+    }
+
+    watchArgs.push("run");
 
     if (launchProfile) {
       // Use the specified launch profile
@@ -652,12 +803,68 @@ server.tool(
       env: process.env,
     });
 
-    // Capture output
+    // Capture output and detect rebuild triggers
     watchProcess.stdout?.on("data", (data) => {
       const text = data.toString();
       outputBuffer.push(text);
       while (outputBuffer.length > 100) {
         outputBuffer.shift();
+      }
+
+      // EARLY ORPHAN KILLING: When dotnet watch outputs "Building...", it means
+      // a file change was detected and rebuild is starting. We need to kill the
+      // old process IMMEDIATELY to release ports before the new process tries to bind.
+      if (text.includes("Building...") && watchState && watchState.lastChildPid && !watchState.earlyCleanupDone) {
+        const pidToKill = watchState.lastChildPid;
+        outputBuffer.push(`[Hot Reload] Detected rebuild, killing process ${pidToKill} early...\n`);
+
+        // Disconnect debugger immediately
+        if (dapClient) {
+          dapClient.disconnect(false).catch(() => {});
+          dapClient = null;
+        }
+
+        // Kill the process immediately with SIGKILL (SIGTERM may be too slow)
+        try {
+          process.kill(pidToKill, "SIGKILL");
+        } catch {
+          // Process may have already exited
+        }
+
+        // Mark as reconnecting to prevent duplicate handling
+        watchState.reconnecting = true;
+        watchState.earlyCleanupDone = true;
+
+        // Start async port release and reconnection
+        (async () => {
+          // Wait for process to fully terminate
+          const terminateStart = Date.now();
+          while (Date.now() - terminateStart < 5000) {
+            if (!isProcessRunning(pidToKill)) {
+              outputBuffer.push(`[Hot Reload] Process ${pidToKill} terminated\n`);
+              break;
+            }
+            await new Promise((r) => setTimeout(r, 50));
+          }
+
+          // Wait for ports to be released
+          const portsToCheck = watchState?.ports || [];
+          if (portsToCheck.length > 0) {
+            outputBuffer.push(`[Hot Reload] Waiting for ports: ${portsToCheck.join(", ")}...\n`);
+            const { released, portsStillInUse } = await waitForPortsRelease(portsToCheck, 10000);
+            if (released) {
+              outputBuffer.push("[Hot Reload] All ports released\n");
+            } else {
+              outputBuffer.push(`[Hot Reload] Warning: Ports still in use: ${portsStillInUse.join(", ")}\n`);
+            }
+          }
+
+          // Now wait for new process and reconnect
+          // Pass skipCleanup=true since we already did the cleanup above
+          if (watchState) {
+            watchState.reconnectPromise = watchReconnect(true);
+          }
+        })();
       }
     });
 
@@ -674,6 +881,25 @@ server.tool(
       watchState = null;
     });
 
+    // Extract ports from launch profile for port release detection
+    let ports: number[] = [];
+    if (launchProfile) {
+      const launchSettingsPath = path.join(resolvedProjectPath, "Properties", "launchSettings.json");
+      if (fs.existsSync(launchSettingsPath)) {
+        try {
+          const content = fs.readFileSync(launchSettingsPath, "utf-8");
+          const settings = JSON.parse(content) as LaunchSettings;
+          const profile = settings?.profiles?.[launchProfile];
+          if (profile?.applicationUrl) {
+            ports = extractPortsFromUrls(profile.applicationUrl);
+            outputBuffer.push(`[Watch] Detected ports from launch profile: ${ports.join(", ")}\n`);
+          }
+        } catch {
+          // Ignore errors reading launch settings
+        }
+      }
+    }
+
     // Initialize watch state
     watchState = {
       watchProcess,
@@ -682,6 +908,8 @@ server.tool(
       lastChildPid: null,
       reconnecting: false,
       reconnectPromise: null,
+      ports,
+      earlyCleanupDone: false,
     };
 
     // Wait for child process to spawn (poll for up to 30 seconds)
@@ -754,7 +982,13 @@ server.tool(
     });
 
     dapClient.on("terminated", () => {
-      // Process terminated, may need to reconnect for hot reload
+      // Process terminated - disconnect immediately to release file handles
+      // This is critical for --no-hot-reload mode where rebuild starts immediately
+      if (dapClient) {
+        dapClient.disconnect(false).catch(() => {});
+        dapClient = null;
+      }
+      // Then reconnect for hot reload
       if (watchState && !watchState.reconnecting) {
         watchState.reconnectPromise = watchReconnect();
       }
@@ -775,6 +1009,58 @@ server.tool(
       };
     }
 
+    // Start polling to detect process death or orphaning
+    // (SIGKILL to wrapper doesn't terminate the app, it just orphans it)
+    const pollProcessDeath = async () => {
+      while (watchState && watchState.lastChildPid === childPid) {
+        await new Promise((r) => setTimeout(r, 500));
+
+        if (!watchState) break;
+
+        // Check if process is dead
+        if (!isProcessRunning(childPid)) {
+          outputBuffer.push(`[Hot Reload] Process ${childPid} detected as dead (via poll)\n`);
+          triggerReconnect();
+          break;
+        }
+
+        // Check if process was orphaned (parent became init/1)
+        // This happens when dotnet watch kills the wrapper but the app survives
+        try {
+          const ppid = execSync(`ps -o ppid= -p ${childPid} 2>/dev/null`, { encoding: "utf-8" }).trim();
+          if (ppid === "1") {
+            outputBuffer.push(`[Hot Reload] Process ${childPid} was orphaned, killing...\n`);
+            try {
+              process.kill(childPid, "SIGKILL");
+            } catch {
+              // Ignore
+            }
+            // Wait a moment for the process to die
+            await new Promise((r) => setTimeout(r, 500));
+            triggerReconnect();
+            break;
+          }
+        } catch {
+          // If we can't get the PPID, the process is probably dead
+          triggerReconnect();
+          break;
+        }
+      }
+
+      function triggerReconnect() {
+        // Disconnect debugger
+        if (dapClient) {
+          dapClient.disconnect(false).catch(() => {});
+          dapClient = null;
+        }
+        // Trigger reconnect
+        if (watchState && !watchState.reconnecting) {
+          watchState.reconnectPromise = watchReconnect();
+        }
+      }
+    };
+    pollProcessDeath();
+
     // Save session state
     currentSession = {
       program: resolvedProjectPath,
@@ -790,6 +1076,9 @@ server.tool(
     statusMsg += `\nAttached to process: ${childPid}`;
     if (launchProfile) {
       statusMsg += `\nLaunch profile: ${launchProfile}`;
+    }
+    if (noHotReload) {
+      statusMsg += `\nMode: Full restart on changes (--no-hot-reload)`;
     }
     statusMsg += `\n\nThe debugger will automatically reconnect when the app restarts after code changes.`;
     statusMsg += `\nUse 'stop_watch' to stop hot reload mode.`;
