@@ -13,6 +13,7 @@ import {
 } from "./dap-client.js";
 import * as path from "path";
 import * as fs from "fs";
+import { ChildProcess, spawn, execSync, spawnSync } from "child_process";
 
 // State
 let dapClient: DAPClient | null = null;
@@ -32,9 +33,162 @@ interface SessionState {
   resolvedEnv: Record<string, string>;
   processId?: number;
   startTime: Date;
-  mode: "launch" | "attach";
+  mode: "launch" | "attach" | "watch";
 }
 let currentSession: SessionState | null = null;
+
+// Hot reload (watch mode) state
+interface WatchState {
+  watchProcess: ChildProcess;
+  projectPath: string;
+  launchProfile?: string;
+  lastChildPid: number | null;
+  reconnecting: boolean;
+  reconnectPromise: Promise<void> | null;
+}
+let watchState: WatchState | null = null;
+
+// Find child .NET process spawned by dotnet watch
+function findDotnetChildPid(watchPid: number, projectName: string): number | null {
+  try {
+    // Find child processes of dotnet watch that are running our project DLL
+    const result = execSync(
+      `pgrep -P ${watchPid} -a 2>/dev/null || ps --ppid ${watchPid} -o pid,args --no-headers 2>/dev/null`,
+      { encoding: "utf-8", timeout: 5000 }
+    ).trim();
+
+    if (!result) return null;
+
+    // Parse output to find the .NET process running our project
+    const lines = result.split("\n");
+    for (const line of lines) {
+      if (line.includes(projectName) && line.includes(".dll")) {
+        const pid = parseInt(line.trim().split(/\s+/)[0], 10);
+        if (!isNaN(pid)) return pid;
+      }
+    }
+
+    // Fallback: find any dotnet child process
+    for (const line of lines) {
+      if (line.includes("dotnet") && !line.includes("watch")) {
+        const pid = parseInt(line.trim().split(/\s+/)[0], 10);
+        if (!isNaN(pid)) return pid;
+      }
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// Check if a process is still running
+function isProcessRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Auto-reconnect logic for watch mode
+async function watchReconnect(): Promise<void> {
+  if (!watchState || watchState.reconnecting) return;
+
+  watchState.reconnecting = true;
+  outputBuffer.push("[Hot Reload] Detecting app restart, reconnecting debugger...\n");
+
+  // Disconnect existing client
+  if (dapClient) {
+    try {
+      await dapClient.disconnect(false);
+    } catch {
+      // Ignore
+    }
+    dapClient = null;
+  }
+
+  // Wait for new process to spawn (poll for up to 30 seconds)
+  const projectName = path.basename(watchState.projectPath);
+  let newPid: number | null = null;
+  const startTime = Date.now();
+
+  while (Date.now() - startTime < 30000) {
+    await new Promise((r) => setTimeout(r, 500));
+
+    if (!watchState?.watchProcess.pid) break;
+
+    newPid = findDotnetChildPid(watchState.watchProcess.pid, projectName);
+    if (newPid && newPid !== watchState.lastChildPid) {
+      // Give the process a moment to initialize
+      await new Promise((r) => setTimeout(r, 1000));
+      break;
+    }
+  }
+
+  if (!newPid) {
+    outputBuffer.push("[Hot Reload] Failed to find new process, watch mode may be broken\n");
+    watchState.reconnecting = false;
+    return;
+  }
+
+  // Attach to new process
+  try {
+    dapClient = new DAPClient();
+
+    dapClient.on("stopped", (body: StoppedEventBody) => {
+      lastStoppedReason = body.reason;
+      lastStoppedThreadId = body.threadId || null;
+    });
+
+    dapClient.on("output", (body: OutputEventBody) => {
+      if (body.output) {
+        outputBuffer.push(body.output);
+        while (outputBuffer.length > 100) {
+          outputBuffer.shift();
+        }
+      }
+    });
+
+    dapClient.on("terminated", () => {
+      // Process terminated, may need to reconnect
+      if (watchState && !watchState.reconnecting) {
+        watchState.reconnectPromise = watchReconnect();
+      }
+    });
+
+    await dapClient.start();
+    await dapClient.attach(newPid);
+
+    watchState.lastChildPid = newPid;
+
+    // Reapply breakpoints
+    for (const [file, bps] of breakpointsByFile) {
+      const lines = Array.from(bps.keys());
+      if (lines.length > 0) {
+        try {
+          const breakpoints = lines.map((l) => ({ line: l }));
+          await dapClient.setBreakpoints(file, breakpoints);
+        } catch {
+          // Ignore breakpoint errors during reconnect
+        }
+      }
+    }
+
+    if (currentSession) {
+      currentSession.processId = newPid;
+      currentSession.startTime = new Date();
+    }
+
+    outputBuffer.push(`[Hot Reload] Reconnected to process ${newPid}\n`);
+  } catch (err) {
+    const error = err as Error;
+    outputBuffer.push(`[Hot Reload] Reconnect failed: ${error.message}\n`);
+  }
+
+  watchState.reconnecting = false;
+}
 
 // Stale code detection - compare source vs compiled modification times
 function checkCodeStaleness(): { stale: boolean; message?: string } {
@@ -74,9 +228,16 @@ const server = new McpServer({
 
 // Helper functions
 function requireDebugger(): DAPClient {
+  // Check if we're reconnecting in watch mode
+  if (watchState?.reconnecting) {
+    throw new Error(
+      "Debugger is reconnecting after hot reload. Please wait a moment and try again."
+    );
+  }
+
   if (!dapClient || !dapClient.isRunning()) {
     throw new Error(
-      "Debugger not running. Use 'launch' to start a debug session."
+      "Debugger not running. Use 'launch' or 'launch_watch' to start a debug session."
     );
   }
   return dapClient;
@@ -347,6 +508,299 @@ server.tool(
         {
           type: "text" as const,
           text: `Attached to process ${processId}`,
+        },
+      ],
+    };
+  }
+);
+
+// Tool: launch_watch - Hot reload support via dotnet watch
+server.tool(
+  "launch_watch",
+  "Start debugging with hot reload support using 'dotnet watch'. The debugger will automatically reconnect when the app restarts after code changes.",
+  {
+    projectPath: z.string().describe("Path to the .NET project directory (containing .csproj)"),
+    launchProfile: z
+      .string()
+      .optional()
+      .describe("Name of a launch profile from Properties/launchSettings.json"),
+    args: z
+      .array(z.string())
+      .optional()
+      .describe("Additional arguments to pass to dotnet watch"),
+  },
+  async ({ projectPath, launchProfile, args }) => {
+    // Clean up any existing watch state
+    if (watchState) {
+      try {
+        watchState.watchProcess.kill();
+      } catch {
+        // Ignore
+      }
+      watchState = null;
+    }
+
+    // Clean up existing debug session
+    if (dapClient) {
+      try {
+        await dapClient.disconnect(true);
+      } catch {
+        // Ignore cleanup errors
+      }
+    }
+
+    // Clear state
+    breakpointsByFile.clear();
+    outputBuffer.length = 0;
+    lastStoppedReason = null;
+    lastStoppedThreadId = null;
+
+    // Resolve project path
+    const resolvedProjectPath = path.isAbsolute(projectPath)
+      ? projectPath
+      : path.resolve(process.cwd(), projectPath);
+
+    if (!fs.existsSync(resolvedProjectPath)) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Project path not found: ${resolvedProjectPath}`,
+          },
+        ],
+      };
+    }
+
+    // Build dotnet watch arguments
+    const watchArgs = ["watch", "run", "--no-launch-profile"];
+
+    if (launchProfile) {
+      // Read environment variables from launch profile and pass them via environment
+      const projectName = path.basename(resolvedProjectPath);
+      const possibleDllPaths = [
+        path.join(resolvedProjectPath, "bin", "Debug", "net10.0", `${projectName}.dll`),
+        path.join(resolvedProjectPath, "bin", "Debug", "net9.0", `${projectName}.dll`),
+        path.join(resolvedProjectPath, "bin", "Debug", "net8.0", `${projectName}.dll`),
+      ];
+      const dllPath = possibleDllPaths.find(p => fs.existsSync(p)) || possibleDllPaths[0];
+      const envFromProfile = resolveEnvironment(launchProfile, undefined, dllPath);
+
+      // We'll pass these through process.env for the spawn
+      Object.assign(process.env, envFromProfile);
+    }
+
+    if (args && args.length > 0) {
+      watchArgs.push("--", ...args);
+    }
+
+    outputBuffer.push(`[Watch] Starting: dotnet ${watchArgs.join(" ")}\n`);
+    outputBuffer.push(`[Watch] Working directory: ${resolvedProjectPath}\n`);
+
+    // Start dotnet watch
+    const watchProcess = spawn("dotnet", watchArgs, {
+      cwd: resolvedProjectPath,
+      stdio: ["pipe", "pipe", "pipe"],
+      env: process.env,
+    });
+
+    // Capture output
+    watchProcess.stdout?.on("data", (data) => {
+      const text = data.toString();
+      outputBuffer.push(text);
+      while (outputBuffer.length > 100) {
+        outputBuffer.shift();
+      }
+    });
+
+    watchProcess.stderr?.on("data", (data) => {
+      const text = `[stderr] ${data.toString()}`;
+      outputBuffer.push(text);
+      while (outputBuffer.length > 100) {
+        outputBuffer.shift();
+      }
+    });
+
+    watchProcess.on("exit", (code) => {
+      outputBuffer.push(`[Watch] Process exited with code ${code}\n`);
+      watchState = null;
+    });
+
+    // Initialize watch state
+    watchState = {
+      watchProcess,
+      projectPath: resolvedProjectPath,
+      launchProfile,
+      lastChildPid: null,
+      reconnecting: false,
+      reconnectPromise: null,
+    };
+
+    // Wait for child process to spawn (poll for up to 30 seconds)
+    const projectName = path.basename(resolvedProjectPath);
+    let childPid: number | null = null;
+    const startTime = Date.now();
+
+    outputBuffer.push(`[Watch] Waiting for app to start...\n`);
+
+    while (Date.now() - startTime < 30000) {
+      await new Promise((r) => setTimeout(r, 1000));
+
+      if (!watchProcess.pid) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: "dotnet watch failed to start",
+            },
+          ],
+        };
+      }
+
+      childPid = findDotnetChildPid(watchProcess.pid, projectName);
+      if (childPid) {
+        // Give the process a moment to fully initialize
+        await new Promise((r) => setTimeout(r, 2000));
+        break;
+      }
+    }
+
+    if (!childPid) {
+      // Clean up
+      try {
+        watchProcess.kill();
+      } catch {
+        // Ignore
+      }
+      watchState = null;
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Timeout waiting for app to start. Check output:\n${outputBuffer.slice(-10).join("")}`,
+          },
+        ],
+      };
+    }
+
+    watchState.lastChildPid = childPid;
+    outputBuffer.push(`[Watch] Found child process: ${childPid}\n`);
+
+    // Attach debugger to child process
+    dapClient = new DAPClient();
+
+    dapClient.on("stopped", (body: StoppedEventBody) => {
+      lastStoppedReason = body.reason;
+      lastStoppedThreadId = body.threadId || null;
+    });
+
+    dapClient.on("output", (body: OutputEventBody) => {
+      if (body.output) {
+        outputBuffer.push(body.output);
+        while (outputBuffer.length > 100) {
+          outputBuffer.shift();
+        }
+      }
+    });
+
+    dapClient.on("terminated", () => {
+      // Process terminated, may need to reconnect for hot reload
+      if (watchState && !watchState.reconnecting) {
+        watchState.reconnectPromise = watchReconnect();
+      }
+    });
+
+    try {
+      await dapClient.start();
+      await dapClient.attach(childPid);
+    } catch (err) {
+      const error = err as Error;
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Failed to attach debugger: ${error.message}`,
+          },
+        ],
+      };
+    }
+
+    // Save session state
+    currentSession = {
+      program: resolvedProjectPath,
+      launchProfile,
+      resolvedEnv: {},
+      processId: childPid,
+      startTime: new Date(),
+      mode: "watch",
+    };
+
+    let statusMsg = `🔥 Hot reload debugging started`;
+    statusMsg += `\nProject: ${resolvedProjectPath}`;
+    statusMsg += `\nAttached to process: ${childPid}`;
+    if (launchProfile) {
+      statusMsg += `\nLaunch profile: ${launchProfile}`;
+    }
+    statusMsg += `\n\nThe debugger will automatically reconnect when the app restarts after code changes.`;
+    statusMsg += `\nUse 'stop_watch' to stop hot reload mode.`;
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: statusMsg,
+        },
+      ],
+    };
+  }
+);
+
+// Tool: stop_watch - Stop hot reload mode
+server.tool(
+  "stop_watch",
+  "Stop hot reload debugging mode and terminate the dotnet watch process",
+  {},
+  async () => {
+    if (!watchState) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: "No watch session active",
+          },
+        ],
+      };
+    }
+
+    // Disconnect debugger
+    if (dapClient) {
+      try {
+        await dapClient.disconnect(false);
+      } catch {
+        // Ignore
+      }
+      dapClient = null;
+    }
+
+    // Kill watch process
+    try {
+      watchState.watchProcess.kill("SIGTERM");
+    } catch {
+      // Ignore
+    }
+
+    watchState = null;
+    breakpointsByFile.clear();
+    outputBuffer.length = 0;
+    lastStoppedReason = null;
+    lastStoppedThreadId = null;
+    currentSession = null;
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: "Hot reload debugging stopped",
         },
       ],
     };
@@ -894,6 +1348,14 @@ server.tool(
       statusText += `\n  Uptime: ${uptime}s`;
     }
 
+    // Watch mode specific info
+    if (watchState) {
+      statusText += `\n\nHot Reload Info:`;
+      statusText += `\n  Watch Process PID: ${watchState.watchProcess.pid || "unknown"}`;
+      statusText += `\n  Child App PID: ${watchState.lastChildPid || "waiting..."}`;
+      statusText += `\n  Reconnecting: ${watchState.reconnecting ? "Yes (please wait)" : "No"}`;
+    }
+
     // Check for stale code
     const staleness = checkCodeStaleness();
     if (staleness.stale && staleness.message) {
@@ -1081,7 +1543,6 @@ server.tool(
 );
 
 // Tool: invoke
-import { spawn, spawnSync } from "child_process";
 
 // Get harness path relative to this file
 const harnessDir = path.resolve(
