@@ -36,6 +36,36 @@ interface SessionState {
 }
 let currentSession: SessionState | null = null;
 
+// Stale code detection - compare source vs compiled modification times
+function checkCodeStaleness(): { stale: boolean; message?: string } {
+  try {
+    // Get paths relative to this file's location
+    const compiledPath = new URL(import.meta.url).pathname;
+    const srcDir = path.resolve(path.dirname(compiledPath), "..", "src");
+    const sourcePath = path.join(srcDir, "index.ts");
+
+    if (!fs.existsSync(sourcePath)) {
+      return { stale: false }; // Can't check if source doesn't exist
+    }
+
+    const compiledStat = fs.statSync(compiledPath);
+    const sourceStat = fs.statSync(sourcePath);
+
+    if (sourceStat.mtimeMs > compiledStat.mtimeMs) {
+      const diffMs = sourceStat.mtimeMs - compiledStat.mtimeMs;
+      const diffMins = Math.round(diffMs / 60000);
+      return {
+        stale: true,
+        message: `⚠️ Source code is ${diffMins > 0 ? diffMins + " minute(s)" : "seconds"} newer than compiled code. Run 'npm run build' and restart MCP server to pick up changes.`,
+      };
+    }
+
+    return { stale: false };
+  } catch {
+    return { stale: false }; // Fail silently
+  }
+}
+
 // Create MCP server
 const server = new McpServer({
   name: "mcp-netcoredbg",
@@ -807,11 +837,19 @@ server.tool(
   {},
   async () => {
     if (!dapClient || !dapClient.isRunning()) {
+      let text = "Debugger not running";
+
+      // Still check for stale code even when not running
+      const staleness = checkCodeStaleness();
+      if (staleness.stale && staleness.message) {
+        text += `\n\n${staleness.message}`;
+      }
+
       return {
         content: [
           {
             type: "text" as const,
-            text: "Debugger not running",
+            text,
           },
         ],
       };
@@ -854,6 +892,12 @@ server.tool(
       }
       const uptime = Math.floor((Date.now() - currentSession.startTime.getTime()) / 1000);
       statusText += `\n  Uptime: ${uptime}s`;
+    }
+
+    // Check for stale code
+    const staleness = checkCodeStaleness();
+    if (staleness.stale && staleness.message) {
+      statusText += `\n\n${staleness.message}`;
     }
 
     return {
