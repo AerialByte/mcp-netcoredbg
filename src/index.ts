@@ -21,6 +21,21 @@ const outputBuffer: string[] = [];
 let lastStoppedReason: string | null = null;
 let lastStoppedThreadId: number | null = null;
 
+// Session state for restart capability
+interface SessionState {
+  program: string;
+  args?: string[];
+  cwd?: string;
+  stopAtEntry?: boolean;
+  launchProfile?: string;
+  env?: Record<string, string>;
+  resolvedEnv: Record<string, string>;
+  processId?: number;
+  startTime: Date;
+  mode: "launch" | "attach";
+}
+let currentSession: SessionState | null = null;
+
 // Create MCP server
 const server = new McpServer({
   name: "mcp-netcoredbg",
@@ -212,6 +227,19 @@ server.tool(
 
     await dapClient.sendRequest("configurationDone", {});
 
+    // Save session state for restart capability
+    currentSession = {
+      program,
+      args,
+      cwd,
+      stopAtEntry,
+      launchProfile,
+      env,
+      resolvedEnv,
+      startTime: new Date(),
+      mode: "launch",
+    };
+
     // Build status message
     let statusMsg = `Debugger started for: ${program}`;
     statusMsg += `\nCapabilities: ${Object.keys(capabilities).filter((k) => capabilities[k] === true).join(", ")}`;
@@ -274,6 +302,15 @@ server.tool(
 
     await dapClient.start();
     await dapClient.attach(processId);
+
+    // Save session state for attach mode
+    currentSession = {
+      program: `process:${processId}`,
+      resolvedEnv: {},
+      processId,
+      startTime: new Date(),
+      mode: "attach",
+    };
 
     return {
       content: [
@@ -795,11 +832,35 @@ server.tool(
       0
     );
 
+    // Build detailed status with session info
+    let statusText = `Status: ${status}\nBreakpoints: ${bpCount}\nOutput lines buffered: ${outputBuffer.length}`;
+
+    if (currentSession) {
+      statusText += `\n\nSession Info:`;
+      statusText += `\n  Mode: ${currentSession.mode}`;
+      statusText += `\n  Program: ${currentSession.program}`;
+      if (currentSession.launchProfile) {
+        statusText += `\n  Launch Profile: ${currentSession.launchProfile}`;
+      }
+      if (currentSession.processId) {
+        statusText += `\n  Process ID: ${currentSession.processId}`;
+      }
+      if (currentSession.cwd) {
+        statusText += `\n  Working Dir: ${currentSession.cwd}`;
+      }
+      const envKeys = Object.keys(currentSession.resolvedEnv);
+      if (envKeys.length > 0) {
+        statusText += `\n  Env Vars: ${envKeys.join(", ")}`;
+      }
+      const uptime = Math.floor((Date.now() - currentSession.startTime.getTime()) / 1000);
+      statusText += `\n  Uptime: ${uptime}s`;
+    }
+
     return {
       content: [
         {
           type: "text" as const,
-          text: `Status: ${status}\nBreakpoints: ${bpCount}\nOutput lines buffered: ${outputBuffer.length}`,
+          text: statusText,
         },
       ],
     };
@@ -829,12 +890,146 @@ server.tool(
     outputBuffer.length = 0;
     lastStoppedReason = null;
     lastStoppedThreadId = null;
+    currentSession = null;
 
     return {
       content: [
         {
           type: "text" as const,
           text: "Debug session terminated",
+        },
+      ],
+    };
+  }
+);
+
+// Tool: restart
+server.tool(
+  "restart",
+  "Restart the debugged program using the same launch settings. Useful after code changes.",
+  {
+    rebuild: z.boolean().optional().default(false).describe("Run 'dotnet build' before restarting (for code changes)"),
+  },
+  async ({ rebuild }) => {
+    if (!currentSession || currentSession.mode !== "launch") {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: "No launch session to restart. Use 'launch' to start a debug session first.",
+          },
+        ],
+      };
+    }
+
+    const session = currentSession;
+
+    // Terminate current session
+    if (dapClient) {
+      try {
+        await dapClient.terminate();
+      } catch {
+        // Ignore cleanup errors
+      }
+    }
+
+    // Optionally rebuild
+    if (rebuild) {
+      const { execSync } = await import("child_process");
+      const projectDir = session.cwd || path.dirname(session.program);
+      try {
+        execSync("dotnet build", { cwd: projectDir, encoding: "utf-8", stdio: "pipe" });
+      } catch (err) {
+        const error = err as Error & { stderr?: string };
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Rebuild failed: ${error.stderr || error.message}`,
+            },
+          ],
+        };
+      }
+    }
+
+    // Clear state
+    breakpointsByFile.clear();
+    outputBuffer.length = 0;
+    lastStoppedReason = null;
+    lastStoppedThreadId = null;
+
+    // Start new client
+    dapClient = new DAPClient();
+
+    dapClient.on("stopped", (body: StoppedEventBody) => {
+      lastStoppedReason = body.reason;
+      lastStoppedThreadId = body.threadId || null;
+    });
+
+    dapClient.on("output", (body: OutputEventBody) => {
+      if (body.output) {
+        outputBuffer.push(body.output);
+        while (outputBuffer.length > 100) {
+          outputBuffer.shift();
+        }
+      }
+    });
+
+    dapClient.on("terminated", () => {
+      dapClient = null;
+    });
+
+    dapClient.on("error", (err: Error) => {
+      console.error("DAP error:", err.message);
+    });
+
+    // Initialize and launch
+    await dapClient.start();
+
+    interface LaunchRequestExtended {
+      program: string;
+      args: string[];
+      cwd: string;
+      stopAtEntry: boolean;
+      console: string;
+      env?: Record<string, string>;
+    }
+
+    const launchRequest: LaunchRequestExtended = {
+      program: session.program,
+      args: session.args || [],
+      cwd: session.cwd || process.cwd(),
+      stopAtEntry: session.stopAtEntry || false,
+      console: "internalConsole",
+    };
+
+    if (Object.keys(session.resolvedEnv).length > 0) {
+      launchRequest.env = session.resolvedEnv;
+    }
+
+    await dapClient.sendRequest("launch", launchRequest);
+    await dapClient.sendRequest("configurationDone", {});
+
+    // Update session start time
+    currentSession = {
+      ...session,
+      startTime: new Date(),
+    };
+
+    let statusMsg = `Restarted: ${session.program}`;
+    if (rebuild) {
+      statusMsg += "\n(Rebuilt before restart)";
+    }
+    if (session.launchProfile) {
+      statusMsg += `\nUsing launch profile: ${session.launchProfile}`;
+    }
+    statusMsg += "\nProgram is running. Set breakpoints or pause to inspect.";
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: statusMsg,
         },
       ],
     };
