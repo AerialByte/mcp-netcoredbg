@@ -20,6 +20,16 @@ Enables AI agents (Claude, etc.) to set breakpoints, step through code, and insp
 
 ## Tools
 
+### Session Management (NEW in v2.0)
+
+| Tool | Description |
+|------|-------------|
+| `list_sessions` | List all active debug sessions |
+| `select_session` | Set the default session for commands |
+| `terminate_session` | Terminate a specific session |
+
+### Launch & Attach
+
 | Tool | Description |
 |------|-------------|
 | `launch` | Start debugging a .NET application (DLL path) |
@@ -28,14 +38,30 @@ Enables AI agents (Claude, etc.) to set breakpoints, step through code, and insp
 | `attach` | Attach to a running .NET process |
 | `invoke` | **Invoke a specific method** in an assembly (with optional debugging) |
 | `restart` | Restart the debugged program (for `launch` mode) |
+| `terminate` | Stop debugging session |
+
+### Breakpoints
+
+| Tool | Description |
+|------|-------------|
 | `set_breakpoint` | Set breakpoint at file:line (supports conditions) |
 | `remove_breakpoint` | Remove a breakpoint |
 | `list_breakpoints` | List all active breakpoints |
+
+### Execution Control
+
+| Tool | Description |
+|------|-------------|
 | `continue` | Continue execution |
 | `pause` | Pause execution |
 | `step_over` | Step over current line |
 | `step_into` | Step into function call |
 | `step_out` | Step out of current function |
+
+### Inspection
+
+| Tool | Description |
+|------|-------------|
 | `stack_trace` | Get current call stack |
 | `scopes` | Get variable scopes for a stack frame |
 | `variables` | Get variables from a scope |
@@ -43,7 +69,68 @@ Enables AI agents (Claude, etc.) to set breakpoints, step through code, and insp
 | `threads` | List all threads |
 | `output` | Get recent program output |
 | `status` | Get debugger status |
-| `terminate` | Stop debugging session |
+
+**Note:** All tools accept an optional `sessionId` parameter to target a specific session. If omitted, the default session is used.
+
+## Multi-Session Debugging (v2.0)
+
+Version 2.0 introduces support for multiple simultaneous debug sessions. This allows you to debug multiple .NET applications concurrently - for example, an API and a background worker.
+
+### Auto-Generated Session IDs
+
+When you launch a debug session without specifying a `sessionId`, one is automatically derived from the project/program name:
+
+- `TopServer.Service.Api` → session ID: `api`
+- `TopServer.Service.Worker` → session ID: `worker`
+- `MyApp.Web` → session ID: `web`
+- Custom: specify `sessionId` parameter explicitly
+
+### Example: Debugging API + Worker Simultaneously
+
+```
+# Start API debugging
+launch_watch projectPath=/path/to/MyApp.Api launchProfile=https
+→ Session 'api' created
+
+# Start Worker in a second session
+launch_watch projectPath=/path/to/MyApp.Worker launchProfile=default
+→ Session 'worker' created
+
+# List all sessions
+list_sessions
+→ api (default): watch - /path/to/MyApp.Api [running]
+   worker: watch - /path/to/MyApp.Worker [running]
+
+# Set breakpoint in API
+set_breakpoint file=/path/to/ApiController.cs line=42 sessionId=api
+
+# Set breakpoint in Worker
+set_breakpoint file=/path/to/WorkerService.cs line=100 sessionId=worker
+
+# Continue API execution
+continue sessionId=api
+
+# Check Worker status
+status sessionId=worker
+
+# Switch default session
+select_session sessionId=worker
+
+# Now commands without sessionId go to worker
+continue  # continues worker
+```
+
+### Session Management Commands
+
+| Command | Description |
+|---------|-------------|
+| `list_sessions` | Show all active sessions with status |
+| `select_session` | Change which session receives commands by default |
+| `terminate_session` | Stop a specific session |
+
+### Backward Compatibility
+
+If you only use one session, the behavior is unchanged from v1.x - no `sessionId` parameter needed.
 
 ## Method Invocation (`invoke`)
 
