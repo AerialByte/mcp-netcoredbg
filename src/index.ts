@@ -49,30 +49,87 @@ interface WatchState {
 let watchState: WatchState | null = null;
 
 // Find child .NET process spawned by dotnet watch
-function findDotnetChildPid(watchPid: number, projectName: string): number | null {
+// In modern .NET (8+), the hierarchy is: dotnet watch -> dotnet-watch.dll -> dotnet run -> app executable
+function findDotnetChildPid(watchPid: number, projectPath: string): number | null {
   try {
-    // Find child processes of dotnet watch that are running our project DLL
-    const result = execSync(
-      `pgrep -P ${watchPid} -a 2>/dev/null || ps --ppid ${watchPid} -o pid,args --no-headers 2>/dev/null`,
+    // Get all process info
+    const allProcesses = execSync(
+      `ps -e --format pid,args --no-headers 2>/dev/null`,
       { encoding: "utf-8", timeout: 5000 }
     ).trim();
 
-    if (!result) return null;
+    const lines = allProcesses.split("\n");
+    const searchPath = `${projectPath}/bin/`;
 
-    // Parse output to find the .NET process running our project
-    const lines = result.split("\n");
+    // Strategy 1: Look for a process running from the project's bin directory
+    // This catches both the native executable and dotnet running the DLL
     for (const line of lines) {
-      if (line.includes(projectName) && line.includes(".dll")) {
-        const pid = parseInt(line.trim().split(/\s+/)[0], 10);
-        if (!isNaN(pid)) return pid;
+      const trimmed = line.trim();
+      // Match: /path/to/project/bin/Debug/net*/AppName or AppName.dll
+      if (trimmed.includes(searchPath) &&
+          !trimmed.includes("watch") &&
+          !trimmed.includes("MSBuild") &&
+          !trimmed.includes("dotnet-watch.dll") &&
+          !trimmed.includes("grep")) {
+        const pid = parseInt(trimmed.split(/\s+/)[0], 10);
+        if (!isNaN(pid)) {
+          return pid;
+        }
       }
     }
 
-    // Fallback: find any dotnet child process
+    // Strategy 2: Find "dotnet run --no-build" with DOTNET_WATCH env (spawned by watch)
+    // Then get its child process (the actual app)
     for (const line of lines) {
-      if (line.includes("dotnet") && !line.includes("watch")) {
-        const pid = parseInt(line.trim().split(/\s+/)[0], 10);
-        if (!isNaN(pid)) return pid;
+      const trimmed = line.trim();
+      if (trimmed.includes("dotnet") &&
+          trimmed.includes("run") &&
+          trimmed.includes("--no-build") &&
+          trimmed.includes("DOTNET_WATCH=1") &&
+          !trimmed.includes("watch run")) {
+        const pid = parseInt(trimmed.split(/\s+/)[0], 10);
+        if (!isNaN(pid)) {
+          // This is the "dotnet run" process, find its child (the actual app)
+          try {
+            const childResult = execSync(
+              `pgrep -P ${pid} 2>/dev/null`,
+              { encoding: "utf-8", timeout: 5000 }
+            ).trim();
+            if (childResult) {
+              const childPid = parseInt(childResult.split("\n")[0].trim(), 10);
+              if (!isNaN(childPid)) return childPid;
+            }
+          } catch {
+            // If no child found, the dotnet run process itself is what we want
+            return pid;
+          }
+        }
+      }
+    }
+
+    // Strategy 3: Find any process with DOTNET_WATCH_ITERATION in its command
+    // This is set by dotnet watch for the child process
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed.includes("DOTNET_WATCH_ITERATION") &&
+          !trimmed.includes("watch run") &&
+          !trimmed.includes("dotnet-watch.dll")) {
+        const pid = parseInt(trimmed.split(/\s+/)[0], 10);
+        if (!isNaN(pid)) {
+          // Get the child of this process
+          try {
+            const childResult = execSync(
+              `pgrep -P ${pid} 2>/dev/null`,
+              { encoding: "utf-8", timeout: 5000 }
+            ).trim();
+            if (childResult) {
+              const childPid = parseInt(childResult.split("\n")[0].trim(), 10);
+              if (!isNaN(childPid)) return childPid;
+            }
+          } catch {
+            return pid;
+          }
+        }
       }
     }
 
@@ -110,7 +167,6 @@ async function watchReconnect(): Promise<void> {
   }
 
   // Wait for new process to spawn (poll for up to 30 seconds)
-  const projectName = path.basename(watchState.projectPath);
   let newPid: number | null = null;
   const startTime = Date.now();
 
@@ -119,7 +175,7 @@ async function watchReconnect(): Promise<void> {
 
     if (!watchState?.watchProcess.pid) break;
 
-    newPid = findDotnetChildPid(watchState.watchProcess.pid, projectName);
+    newPid = findDotnetChildPid(watchState.watchProcess.pid, watchState.projectPath);
     if (newPid && newPid !== watchState.lastChildPid) {
       // Give the process a moment to initialize
       await new Promise((r) => setTimeout(r, 1000));
@@ -629,11 +685,11 @@ server.tool(
     };
 
     // Wait for child process to spawn (poll for up to 30 seconds)
-    const projectName = path.basename(resolvedProjectPath);
     let childPid: number | null = null;
     const startTime = Date.now();
 
     outputBuffer.push(`[Watch] Waiting for app to start...\n`);
+    outputBuffer.push(`[Watch] Looking for processes in: ${resolvedProjectPath}/bin/\n`);
 
     while (Date.now() - startTime < 30000) {
       await new Promise((r) => setTimeout(r, 1000));
@@ -649,7 +705,8 @@ server.tool(
         };
       }
 
-      childPid = findDotnetChildPid(watchProcess.pid, projectName);
+      childPid = findDotnetChildPid(watchProcess.pid, resolvedProjectPath);
+      outputBuffer.push(`[Watch] Poll result: ${childPid || "not found"}\n`);
       if (childPid) {
         // Give the process a moment to fully initialize
         await new Promise((r) => setTimeout(r, 2000));
@@ -670,7 +727,7 @@ server.tool(
         content: [
           {
             type: "text" as const,
-            text: `Timeout waiting for app to start. Check output:\n${outputBuffer.slice(-10).join("")}`,
+            text: `Timeout waiting for app to start. resolvedProjectPath=${resolvedProjectPath}\nCheck output:\n${outputBuffer.slice(-30).join("")}`,
           },
         ],
       };
