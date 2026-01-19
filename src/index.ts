@@ -11,6 +11,8 @@ import {
   StoppedEventBody,
   OutputEventBody,
 } from "./dap-client.js";
+import * as path from "path";
+import * as fs from "fs";
 
 // State
 let dapClient: DAPClient | null = null;
@@ -48,6 +50,74 @@ function formatVariable(v: Variable, indent = 0): string {
   return `${prefix}${v.name}${type} = ${v.value}`;
 }
 
+// Helper to read and parse launchSettings.json
+interface LaunchProfile {
+  commandName?: string;
+  environmentVariables?: Record<string, string>;
+  applicationUrl?: string;
+  dotnetRunMessages?: boolean;
+}
+
+interface LaunchSettings {
+  profiles?: Record<string, LaunchProfile>;
+}
+
+function readLaunchSettings(programPath: string): LaunchSettings | null {
+  const programDir = path.dirname(programPath);
+  // Walk up from bin/Debug/net*/app.dll to find Properties/launchSettings.json
+  // Typical structure: ProjectDir/bin/Debug/net8.0/app.dll
+  // We need: ProjectDir/Properties/launchSettings.json
+  let searchDir = programDir;
+  for (let i = 0; i < 5; i++) {
+    const launchSettingsPath = path.join(searchDir, "Properties", "launchSettings.json");
+    if (fs.existsSync(launchSettingsPath)) {
+      try {
+        const content = fs.readFileSync(launchSettingsPath, "utf-8");
+        return JSON.parse(content) as LaunchSettings;
+      } catch {
+        return null;
+      }
+    }
+    const parent = path.dirname(searchDir);
+    if (parent === searchDir) break;
+    searchDir = parent;
+  }
+  return null;
+}
+
+function resolveEnvironment(
+  launchProfile: string | undefined,
+  explicitEnv: Record<string, string> | undefined,
+  programPath: string
+): Record<string, string> {
+  const resolved: Record<string, string> = {};
+
+  // If launchProfile specified, try to read settings
+  if (launchProfile) {
+    const settings = readLaunchSettings(programPath);
+    if (settings?.profiles?.[launchProfile]) {
+      const profile = settings.profiles[launchProfile];
+
+      // Add environment variables from profile
+      if (profile.environmentVariables) {
+        Object.assign(resolved, profile.environmentVariables);
+      }
+
+      // Extract applicationUrl and set ASPNETCORE_URLS
+      if (profile.applicationUrl) {
+        resolved["ASPNETCORE_URLS"] = profile.applicationUrl;
+      }
+    }
+  }
+
+  // Explicit env overrides profile settings
+  if (explicitEnv) {
+    Object.assign(resolved, explicitEnv);
+  }
+
+  return resolved;
+}
+
 // Tool: launch
 server.tool(
   "launch",
@@ -67,8 +137,16 @@ server.tool(
       .optional()
       .default(false)
       .describe("Stop at the entry point of the program"),
+    env: z
+      .record(z.string())
+      .optional()
+      .describe("Environment variables to pass to the debuggee process"),
+    launchProfile: z
+      .string()
+      .optional()
+      .describe("Name of a launch profile from Properties/launchSettings.json to use for environment variables and URLs"),
   },
-  async ({ program, args, cwd, stopAtEntry }) => {
+  async ({ program, args, cwd, stopAtEntry, env, launchProfile }) => {
     // Clean up existing session
     if (dapClient) {
       try {
@@ -114,21 +192,45 @@ server.tool(
     // Initialize and launch
     const capabilities = await dapClient.start();
 
-    await dapClient.sendRequest("launch", {
+    // Resolve environment variables from launchProfile and explicit env
+    const resolvedEnv = resolveEnvironment(launchProfile, env, program);
+
+    const launchRequest: Record<string, unknown> = {
       program,
       args: args || [],
       cwd: cwd || process.cwd(),
       stopAtEntry: stopAtEntry || false,
       console: "internalConsole",
-    });
+    };
+
+    // Only include env if we have environment variables to pass
+    if (Object.keys(resolvedEnv).length > 0) {
+      launchRequest.env = resolvedEnv;
+    }
+
+    await dapClient.sendRequest("launch", launchRequest);
 
     await dapClient.sendRequest("configurationDone", {});
+
+    // Build status message
+    let statusMsg = `Debugger started for: ${program}`;
+    statusMsg += `\nCapabilities: ${Object.keys(capabilities).filter((k) => capabilities[k] === true).join(", ")}`;
+
+    if (launchProfile) {
+      statusMsg += `\nUsing launch profile: ${launchProfile}`;
+    }
+
+    if (Object.keys(resolvedEnv).length > 0) {
+      statusMsg += `\nEnvironment variables: ${Object.keys(resolvedEnv).join(", ")}`;
+    }
+
+    statusMsg += stopAtEntry ? "\nStopped at entry point." : "\nProgram is running. Set breakpoints or pause to inspect.";
 
     return {
       content: [
         {
           type: "text" as const,
-          text: `Debugger started for: ${program}\nCapabilities: ${Object.keys(capabilities).filter((k) => capabilities[k] === true).join(", ")}${stopAtEntry ? "\nStopped at entry point." : "\nProgram is running. Set breakpoints or pause to inspect."}`,
+          text: statusMsg,
         },
       ],
     };
@@ -741,8 +843,6 @@ server.tool(
 
 // Tool: invoke
 import { spawn, spawnSync } from "child_process";
-import * as path from "path";
-import * as fs from "fs";
 
 // Get harness path relative to this file
 const harnessDir = path.resolve(
