@@ -23,8 +23,11 @@ Enables AI agents (Claude, etc.) to set breakpoints, step through code, and insp
 | Tool | Description |
 |------|-------------|
 | `launch` | Start debugging a .NET application (DLL path) |
+| `launch_watch` | **Start debugging with hot reload** via `dotnet watch` |
+| `stop_watch` | Stop hot reload debugging mode |
 | `attach` | Attach to a running .NET process |
 | `invoke` | **Invoke a specific method** in an assembly (with optional debugging) |
+| `restart` | Restart the debugged program (for `launch` mode) |
 | `set_breakpoint` | Set breakpoint at file:line (supports conditions) |
 | `remove_breakpoint` | Remove a breakpoint |
 | `list_breakpoints` | List all active breakpoints |
@@ -140,6 +143,60 @@ On error, it provides helpful diagnostics:
   }
 }
 ```
+
+## Hot Reload Debugging (`launch_watch`)
+
+The `launch_watch` tool enables debugging with hot reload support via `dotnet watch`. When you make code changes, the app automatically restarts and the debugger reconnects - preserving your breakpoints.
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `projectPath` | string | Yes | Path to the .NET project directory (containing .csproj) |
+| `launchProfile` | string | No | Name of a launch profile from `Properties/launchSettings.json` |
+| `args` | array | No | Additional arguments to pass to `dotnet watch` |
+
+### Examples
+
+**Basic usage:**
+```json
+{
+  "projectPath": "/path/to/MyApp"
+}
+```
+
+**With launch profile (recommended for ASP.NET apps):**
+```json
+{
+  "projectPath": "/path/to/MyApp.Api",
+  "launchProfile": "https"
+}
+```
+
+The launch profile is important for ASP.NET applications as it sets:
+- `ASPNETCORE_ENVIRONMENT` (e.g., Development)
+- `applicationUrl` (e.g., https://localhost:7179)
+- Other environment variables needed for proper operation
+
+### How It Works
+
+1. Starts `dotnet watch run` with the specified project
+2. Waits for the app to build and start
+3. Automatically attaches the debugger to the running process
+4. When you edit code and save, `dotnet watch` rebuilds and restarts
+5. The debugger detects the restart and reconnects automatically
+6. Breakpoints are preserved across restarts
+
+### Stopping Hot Reload Mode
+
+Use `stop_watch` to cleanly terminate both the debugger and the `dotnet watch` process.
+
+### Status Information
+
+Use `status` to see hot reload specific information:
+- Watch process PID
+- Child app PID
+- Whether the debugger is currently reconnecting
 
 ## Prerequisites
 

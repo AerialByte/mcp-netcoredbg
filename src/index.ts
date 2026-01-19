@@ -572,21 +572,14 @@ server.tool(
     }
 
     // Build dotnet watch arguments
-    const watchArgs = ["watch", "run", "--no-launch-profile"];
+    const watchArgs = ["watch", "run"];
 
     if (launchProfile) {
-      // Read environment variables from launch profile and pass them via environment
-      const projectName = path.basename(resolvedProjectPath);
-      const possibleDllPaths = [
-        path.join(resolvedProjectPath, "bin", "Debug", "net10.0", `${projectName}.dll`),
-        path.join(resolvedProjectPath, "bin", "Debug", "net9.0", `${projectName}.dll`),
-        path.join(resolvedProjectPath, "bin", "Debug", "net8.0", `${projectName}.dll`),
-      ];
-      const dllPath = possibleDllPaths.find(p => fs.existsSync(p)) || possibleDllPaths[0];
-      const envFromProfile = resolveEnvironment(launchProfile, undefined, dllPath);
-
-      // We'll pass these through process.env for the spawn
-      Object.assign(process.env, envFromProfile);
+      // Use the specified launch profile
+      watchArgs.push("--launch-profile", launchProfile);
+    } else {
+      // No profile specified, run without one
+      watchArgs.push("--no-launch-profile");
     }
 
     if (args && args.length > 0) {
